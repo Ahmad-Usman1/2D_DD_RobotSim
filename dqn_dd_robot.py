@@ -110,7 +110,7 @@ class DifferentialDriveEnv(gym.Env):
         reward = delta * 2
         if delta < -0.10:  # only punish if moved away more than 5 cm
             reward += delta * 3.0  # small negative
-        reward -= 1.00 + self.steps*0.01 # living penalty to encourage speed
+        reward -= 1.00 + self.steps * 0.01  # living penalty to encourage speed
         if self._check_collision():
             reward -= 10.0
             terminated = True
