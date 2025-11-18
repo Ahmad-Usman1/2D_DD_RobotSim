@@ -295,6 +295,10 @@ class DQNAgent:
         self.action_size = action_size
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            print(f"CUDA is available!using GPU: {torch.cuda.get_device_name(0)}")
+            print(f"CUDA version: {torch.version.cuda}")
+            print(f"Number of GPUs: {torch.cuda.device_count()}")
 
         self.policy_net = DQN(state_size, action_size).to(self.device)
         self.target_net = DQN(state_size, action_size).to(self.device)
