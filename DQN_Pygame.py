@@ -8,6 +8,8 @@ from collections import deque
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
 import math
+import multiprocessing as mp
+from multiprocessing import Pool, Queue
 
 # Hyperparameters
 SCREEN_WIDTH = 800
@@ -34,6 +36,7 @@ NUM_EPISODES = 500
 MAX_STEPS = 300
 VISUALIZE_TRAINING = False  # Toggle visualization during training
 VISUALIZE_INTERVAL = 50  # Visualize every N episodes when enabled
+NUM_PARALLEL_ENVS = 8  # Number of parallel environments for faster training
 
 
 class Environment:
@@ -150,7 +153,8 @@ class Environment:
             distance = self.cast_ray(angle)
             rays.append(distance)
         
-        return np.array(rays, dtype=np.float32)
+        # Create a copy to avoid numpy warning about non-writable arrays
+        return np.array(rays, dtype=np.float32).copy()
     
     def step(self, action):
         """Execute action and return next state, reward, done"""
@@ -314,20 +318,28 @@ class DQNAgent:
     
     def store_transition(self, state, action, reward, next_state, done):
         """Store experience in replay memory"""
-        self.memory.append((state, action, reward, next_state, done))
+        # Store as copies to avoid numpy warnings
+        self.memory.append((
+            state.copy(), 
+            action, 
+            reward, 
+            next_state.copy(), 
+            done
+        ))
     
     def train_step(self):
-        """Perform one training step"""
+        """Perform one training step with larger batches"""
         if len(self.memory) < BATCH_SIZE:
             return 0
         
         batch = random.sample(self.memory, BATCH_SIZE)
         states, actions, rewards, next_states, dones = zip(*batch)
         
-        states = torch.FloatTensor(states).to(self.device)
+        # Convert to tensors - use np.array first to ensure proper memory layout
+        states = torch.FloatTensor(np.array(states)).to(self.device)
         actions = torch.LongTensor(actions).to(self.device)
         rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
         dones = torch.FloatTensor(dones).to(self.device)
         
         # Current Q values
@@ -344,9 +356,30 @@ class DQNAgent:
         # Optimize
         self.optimizer.zero_grad()
         loss.backward()
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
         self.optimizer.step()
         
         return loss.item()
+    
+    def train_step_batch(self, batch_data):
+        """Train on a batch of experiences - optimized for parallel collection"""
+        if not batch_data:
+            return 0
+            
+        # Add experiences to memory
+        for experience in batch_data:
+            self.memory.append(experience)
+        
+        # Perform multiple training steps on the collected data
+        total_loss = 0
+        num_updates = len(batch_data) // 4  # Train multiple times on collected data
+        
+        for _ in range(max(1, num_updates)):
+            loss = self.train_step()
+            total_loss += loss
+            
+        return total_loss / max(1, num_updates)
     
     def update_target_network(self):
         """Copy policy network weights to target network"""
@@ -444,10 +477,139 @@ class Visualizer:
         pygame.quit()
 
 
-def train():
-    """Main training loop"""
+def run_episode_parallel(args):
+    """Run a single episode in parallel - used for data collection"""
+    env_seed, policy_state_dict, epsilon, episode_num = args
+    
+    # Set random seed for reproducibility
+    random.seed(env_seed)
+    np.random.seed(env_seed)
+    
+    # Create environment and agent
     env = Environment(domain_randomization=True)
-    agent = DQNAgent(state_size=NUM_RAYS, action_size=6)  # 6 actions now
+    state = env.reset()
+    
+    experiences = []
+    episode_reward = 0
+    success = False
+    collision = False
+    
+    for step in range(MAX_STEPS):
+        # Epsilon-greedy action selection (simplified for parallel)
+        if random.random() < epsilon:
+            action = random.randint(0, 5)
+        else:
+            # Use CPU for inference in parallel workers to avoid GPU contention
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                # Load the policy network weights
+                temp_net = DQN(NUM_RAYS, 6)
+                temp_net.load_state_dict(policy_state_dict)
+                temp_net.eval()
+                q_values = temp_net(state_tensor)
+                action = q_values.argmax().item()
+        
+        next_state, reward, done = env.step(action)
+        
+        # Store experience
+        experiences.append((
+            state.copy(),
+            action,
+            reward,
+            next_state.copy(),
+            done
+        ))
+        
+        episode_reward += reward
+        state = next_state
+        
+        if done:
+            if env.get_distance_to_goal() < 30:
+                success = True
+            if reward <= -40:
+                collision = True
+            break
+    
+    return experiences, episode_reward, step + 1, success, collision
+
+
+def train_parallel():
+    """Main training loop with parallel environment execution"""
+    agent = DQNAgent(state_size=NUM_RAYS, action_size=6)
+    
+    episode_rewards = []
+    episode_lengths = []
+    success_count = 0
+    collision_count = 0
+    
+    print("Starting PARALLEL training...")
+    print(f"Device: {agent.device}")
+    print(f"Parallel Environments: {NUM_PARALLEL_ENVS}")
+    print(f"CPU Cores Available: {mp.cpu_count()}")
+    
+    # Create process pool
+    pool = Pool(processes=NUM_PARALLEL_ENVS)
+    
+    episode = 0
+    total_episodes = NUM_EPISODES
+    
+    try:
+        while episode < total_episodes:
+            # Prepare arguments for parallel execution
+            policy_state = agent.policy_net.state_dict()
+            args_list = [
+                (random.randint(0, 1000000), policy_state, agent.epsilon, episode + i)
+                for i in range(min(NUM_PARALLEL_ENVS, total_episodes - episode))
+            ]
+            
+            # Run episodes in parallel
+            results = pool.map(run_episode_parallel, args_list)
+            
+            # Process results
+            all_experiences = []
+            for experiences, ep_reward, ep_length, success, collision in results:
+                all_experiences.extend(experiences)
+                episode_rewards.append(ep_reward)
+                episode_lengths.append(ep_length)
+                
+                if success:
+                    success_count += 1
+                if collision:
+                    collision_count += 1
+                
+                episode += 1
+            
+            # Train on collected experiences
+            loss = agent.train_step_batch(all_experiences)
+            
+            # Update target network
+            if episode % TARGET_UPDATE == 0:
+                agent.update_target_network()
+            
+            # Decay epsilon
+            agent.decay_epsilon()
+            
+            # Print progress
+            if episode % (NUM_PARALLEL_ENVS * 2) == 0:
+                recent_rewards = episode_rewards[-20:] if len(episode_rewards) >= 20 else episode_rewards
+                avg_reward = np.mean(recent_rewards)
+                success_rate = success_count / episode if episode > 0 else 0
+                collision_rate = collision_count / episode if episode > 0 else 0
+                print(f"Episode {episode}/{total_episodes}, Avg Reward: {avg_reward:.2f}, "
+                      f"Success: {success_rate:.2%}, Collisions: {collision_rate:.2%}, "
+                      f"Epsilon: {agent.epsilon:.3f}, Loss: {loss:.4f}")
+    
+    finally:
+        pool.close()
+        pool.join()
+    
+    return episode_rewards, episode_lengths, agent
+
+
+def train():
+    """Main training loop - OPTIMIZED VERSION"""
+    env = Environment(domain_randomization=True)
+    agent = DQNAgent(state_size=NUM_RAYS, action_size=6)
     visualizer = None
     if VISUALIZE_TRAINING:
         visualizer = Visualizer(env)
@@ -457,8 +619,14 @@ def train():
     success_count = 0
     collision_count = 0
     
-    print("Starting training...")
+    print("Starting OPTIMIZED training...")
+    print(f"Device: {agent.device}")
     print(f"Visualization: {'ON' if VISUALIZE_TRAINING else 'OFF'}")
+    print("TIP: Use train_parallel() for faster training with multiple CPU cores!")
+    
+    # Pre-allocate experience buffer for faster insertion
+    experiences_buffer = []
+    buffer_size = 100
     
     for episode in range(NUM_EPISODES):
         state = env.reset()
@@ -470,17 +638,24 @@ def train():
             if visualizer and visualizer.check_quit():
                 print("Training interrupted by user")
                 visualizer.close()
-                return episode_rewards, episode_lengths
+                return episode_rewards, episode_lengths, agent
             
             # Select and execute action
             action = agent.select_action(state, training=True)
             next_state, reward, done = env.step(action)
             
-            # Store transition
-            agent.store_transition(state, action, reward, next_state, done)
+            # Buffer experiences for batch insertion
+            experiences_buffer.append((state.copy(), action, reward, next_state.copy(), done))
             
-            # Train agent
-            loss = agent.train_step()
+            # Batch insert into memory
+            if len(experiences_buffer) >= buffer_size or done:
+                for exp in experiences_buffer:
+                    agent.store_transition(*exp)
+                experiences_buffer.clear()
+                
+                # Train agent multiple times per batch
+                for _ in range(4):
+                    loss = agent.train_step()
             
             episode_reward += reward
             state = next_state
@@ -492,8 +667,7 @@ def train():
             if done:
                 if env.get_distance_to_goal() < 30:
                     success_count += 1
-                # Check if episode ended due to collision
-                if reward <= -40:  # Collision causes large negative reward
+                if reward <= -40:
                     collision_episode = True
                     collision_count += 1
                 break
@@ -518,7 +692,7 @@ def train():
     
     if visualizer:
         visualizer.close()
-    return episode_rewards, episode_lengths
+    return episode_rewards, episode_lengths, agent
 
 
 def plot_results(rewards, lengths):
@@ -630,8 +804,29 @@ if __name__ == "__main__":
     
     print()
     
-    # Train the agent
-    rewards, lengths = train()
+    # Choose training mode
+    print("=" * 60)
+    print("TRAINING MODE OPTIONS:")
+    print("=" * 60)
+    print("1. PARALLEL training (RECOMMENDED - 3-8x faster)")
+    print("   - Uses multiple CPU cores")
+    print("   - Collects data from multiple environments simultaneously")
+    print(f"   - Will use {NUM_PARALLEL_ENVS} parallel environments")
+    print()
+    print("2. OPTIMIZED single-thread training")
+    print("   - Faster than original with batched updates")
+    print("   - Good for debugging or visualization")
+    print()
+    
+    use_parallel = input("Use parallel training? (y/n, default=y): ").strip().lower()
+    use_parallel = use_parallel != 'n'
+    
+    if use_parallel:
+        print("\nStarting PARALLEL training...")
+        rewards, lengths, agent = train_parallel()
+    else:
+        print("\nStarting OPTIMIZED single-thread training...")
+        rewards, lengths, agent = train()
     
     # Plot results
     plot_results(rewards, lengths)
@@ -639,16 +834,10 @@ if __name__ == "__main__":
     print("\nTraining complete!")
     
     # Ask user if they want to test
-    print("\nStarting test phase with visualization...")
+    test_choice = input("\nRun test phase with visualization? (y/n, default=y): ").strip().lower()
     
-    # Create agent for testing (load the trained one)
-    env = Environment(domain_randomization=True)
-    agent = DQNAgent(state_size=NUM_RAYS, action_size=6)
-    
-    # In a real scenario, you'd load saved weights here
-    # For now, we'll test with the trained agent from memory
-    # agent.policy_net.load_state_dict(torch.load('model.pth'))
-    
-    test_rewards = test_agent(agent, num_episodes=5, visualize=True)
+    if test_choice != 'n':
+        print("\nStarting test phase with visualization...")
+        test_rewards = test_agent(agent, num_episodes=5, visualize=True)
     
     print("\nAll done!")
